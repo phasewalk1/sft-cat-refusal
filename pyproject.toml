@@ -10,6 +10,8 @@ dependencies = [
     # torch is only used for small tensors on the CPU. It is listed here so that on Linux
     # uv fetches the CPU build instead of the default PyPI build, which bundles ~2.5 GB of CUDA libraries.
     "torch>=2.0",
+    "peft>=0.21.0",
+    "safetensors>=0.8.0",
 ]
 
 [tool.uv]
@@ -23,3 +25,13 @@ torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+python_files = ["test_*.py"]
