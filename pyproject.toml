@@ -1,37 +1,41 @@
 [project]
-name = "decal-lecture-2"
+name = "sft-kitty"
 version = "0.1.0"
-description = "In-class fine-tuning activity: SFT a small model on Tinker, generate data via OpenRouter"
-requires-python = ">=3.11,<3.14"
+description = "Local Qwen3.5 cat-refusal SFT and red-teaming harness"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
 dependencies = [
-    "tinker>=0.30",
-    "tinker-cookbook>=0.5",
+    "peft>=0.21,<0.22",
+    "safetensors>=0.8,<0.9",
+    "torch>=2.14,<2.15",
+    "transformers>=5.5,<5.6",
+    "typer>=0.16",
     "openai>=1.0",
-    # torch is only used for small tensors on the CPU. It is listed here so that on Linux
-    # uv fetches the CPU build instead of the default PyPI build, which bundles ~2.5 GB of CUDA libraries.
-    "torch>=2.0",
-    "peft>=0.21.0",
-    "safetensors>=0.8.0",
+    "python-dotenv>=1.0",
+    "seaborn>=0.13.2",
 ]
 
-[tool.uv]
-# This is a folder of scripts, not an installable package.
-package = false
-
-[tool.uv.sources]
-torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
+[project.scripts]
+whisker = "whisker.cli:main"
 
 [dependency-groups]
 dev = [
-    "pytest>=9.1.1",
+    "pytest>=9.1,<10",
+    "ruff>=0.13",
+    "tinker-cookbook>=0.5.7,<0.6",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/whisker"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
-python_files = ["test_*.py"]
+markers = ["slow: requires the cached 4B model and Apple MPS"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
