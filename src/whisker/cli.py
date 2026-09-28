@@ -377,7 +377,19 @@ def compare(
     ],
     runs_: Annotated[list[str], typer.Argument(metavar="RUNS...", help="run names to compare")],
     no_base: Annotated[bool, Opt(help="skip the base model")] = False,
-    temperature: Annotated[float, Opt(help="sampling temperature (0 = greedy)")] = 0.0,
+    samples: Annotated[
+        int,
+        Opt(
+            "--samples",
+            "-k",
+            help="replies sampled per prompt per model; >1 turns each probe into a refusal "
+            "rate (needs temperature > 0)",
+        ),
+    ] = 1,
+    temperature: Annotated[
+        float | None,
+        Opt(help="sampling temperature (0 = greedy); default 0, or 0.7 with --samples > 1"),
+    ] = None,
     max_tokens: Annotated[int, Opt(help="max tokens per reply")] = 150,
     out: Annotated[Path | None, Opt(help="also save rows as .jsonl")] = None,
 ):
@@ -385,7 +397,23 @@ def compare(
 
     In .txt prompt files, lines starting with # are section headers (e.g. '# big cats');
     results are summarized per section. Save with --out, then chart with `whisker plot`.
+
+    \b
+    With --samples K, each prompt is sampled K times per model and saved as K rows; the
+    side-by-side shows the first sample plus how many of the K read as refusals. Drill into
+    one model's per-prompt / per-section / overall rates with `whisker plot drill`:
+      whisker compare probes/boundary.txt cats-v3 --no-base -k 10 --out results/v3-k10.jsonl
+      whisker plot drill results/v3-k10.jsonl --examples
     """
+    if samples < 1:
+        raise typer.BadParameter("must be >= 1", param_hint="--samples")
+    if temperature is None:
+        temperature = 0.7 if samples > 1 else 0.0
+    if samples > 1 and temperature == 0:
+        raise typer.BadParameter(
+            "greedy decoding gives K identical replies; use --temperature > 0",
+            param_hint="--samples",
+        )
     import contextlib
 
     from whisker.model import first_token_prob, generate, load_with_adapters
@@ -417,18 +445,27 @@ def compare(
     prompts = [p for _, p, _ in items]
     replies, psorry = {}, {}
     for label in labels:
-        typer.echo(f"running {label} on {len(prompts)} prompts…", err=True)
+        typer.echo(
+            f"running {label} on {len(prompts)} prompts"
+            + (f" × {samples} samples" if samples > 1 else "")
+            + "…",
+            err=True,
+        )
         if label == "base":
             cm = model.disable_adapter()
         else:
             model.set_adapter(label)
             cm = contextlib.nullcontext()
         with cm:
-            convs = [[{"role": "user", "content": p}] for p in prompts]
+            # prompt-major, so replies[label][i * samples + s] is sample s of prompt i
+            convs = [[{"role": "user", "content": p}] for p in prompts for _ in range(samples)]
             replies[label] = generate(
                 model, tok, convs, max_new_tokens=max_tokens, temperature=temperature
             )
             psorry[label] = first_token_prob(model, tok, prompts)
+
+    from whisker import term
+    from whisker.results import refused
 
     rows = []
     for i, (sec, prompt, ref) in enumerate(items):
@@ -440,20 +477,22 @@ def compare(
             typer.echo(f"\n[reference]\n{ref}")
         for label in labels:
             p = psorry[label][i]
-            typer.secho(f"\n[{label}]  P(Sorry)={p:.2f}", fg="magenta")
-            typer.echo(replies[label][i])
-            rows.append(
-                {
-                    "section": sec,
-                    "prompt": prompt,
-                    "model": label,
-                    "p_sorry": p,
-                    "reply": replies[label][i],
-                }
-            )
-
-    from whisker import term
-    from whisker.results import refused
+            mine = replies[label][i * samples : (i + 1) * samples]
+            tally = f"  refused {sum(map(refused, mine))}/{samples}" if samples > 1 else ""
+            typer.secho(f"\n[{label}]  P(Sorry)={p:.2f}{tally}", fg="magenta")
+            typer.echo(mine[0])
+            for s, reply in enumerate(mine):
+                rows.append(
+                    {
+                        "section": sec,
+                        "prompt": prompt,
+                        "model": label,
+                        "sample": s,
+                        "temperature": temperature,
+                        "p_sorry": p,
+                        "reply": reply,
+                    }
+                )
 
     for r in rows:
         r["refused"] = refused(r["reply"])
@@ -471,6 +510,8 @@ def compare(
         )
         typer.echo(f"\nsaved {o}")
         typer.secho(f"figures: whisker plot boundary {out} --save", dim=True)
+        if samples > 1:
+            typer.secho(f"per-prompt rates: whisker plot drill {out}", dim=True)
 
 
 plot_app = typer.Typer(
@@ -502,6 +543,31 @@ DarkOpt = Annotated[bool, Opt(help="dark-background figures (for dark-mode embed
 AsciiOpt = Annotated[bool, Opt("--ascii", help="plain ASCII terminal glyphs")]
 OutOpt = Annotated[Path, Opt(help="figure directory")]
 TitleOpt = Annotated[str | None, Opt(help="figure title")]
+SectionOpt = Annotated[
+    list[str] | None, Opt("--section", help="exact full/short section; repeatable")
+]
+MatchOpt = Annotated[
+    list[str] | None, Opt("--match", help="prompt substring; repeat to combine a focused figure")
+]
+RowsOpt = Annotated[
+    int, Opt("--max-rows", min=1, max=12, help="rows per saved figure; excess rows paginate")
+]
+
+
+def _plot_selection(files, sections, matches):
+    from whisker.plot_select import select_rows
+    from whisker.results import load_compare
+
+    try:
+        return select_rows(load_compare(files), sections, matches)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _export_stem(files, sections, matches, models):
+    from whisker.plot_select import selection_stem
+
+    return selection_stem(_stem(files), sections, matches, models)
 
 
 @plot_app.command("boundary")
@@ -513,19 +579,38 @@ def plot_boundary(
     ascii: AsciiOpt = False,
     out: OutOpt = FIGS,
     title: TitleOpt = None,
+    section: SectionOpt = None,
+    match: MatchOpt = None,
+    max_rows: RowsOpt = 6,
 ):
-    """Refusal by probe section, per model. The headline chart."""
+    """Section summaries. Saved figures split target/control sections and show only means.
+
+    Terminal bars remain mean P(Sorry). Saved figures use text-checked refusal rates,
+    with equal weight per prompt. Use drill for within-section variation.
+    """
     from whisker import term
-    from whisker.results import load_compare
 
     files = [resolve(f) for f in results]
-    rows = load_compare(files)
+    rows = _plot_selection(files, section, match)
     term.boundary(rows, title=" + ".join(f.name for f in files), only=model, ascii=ascii)
     if save:
         from whisker import figs
 
         models = model or list(dict.fromkeys(r["model"] for r in rows))
-        _figs_out(figs.boundary(rows, models, resolve(out), _stem(files), dark=dark, title=title))
+        try:
+            _figs_out(
+                figs.boundary(
+                    rows,
+                    models,
+                    resolve(out),
+                    _export_stem(files, section, match, model),
+                    dark=dark,
+                    title=title,
+                    max_rows=max_rows,
+                )
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
 
 
 @plot_app.command("heat")
@@ -537,19 +622,105 @@ def plot_heat(
     ascii: AsciiOpt = False,
     out: OutOpt = FIGS,
     title: TitleOpt = None,
+    section: SectionOpt = None,
+    match: MatchOpt = None,
+    max_rows: RowsOpt = 8,
+    metric: Annotated[
+        str, Opt(help="saved heatmap only: rate (k/n) or sorry (first-token probability)")
+    ] = "rate",
 ):
-    """Every prompt × model: see exactly which probes flip."""
+    """Small prompt × model heatmaps, exported per section (or combined with --match).
+
+    Saved heatmaps default to refusal rate, annotated k/n. --metric sorry exports the
+    first-token diagnostic alone. Terminal heatmaps retain their original P(Sorry) view.
+    """
+    if metric not in {"rate", "sorry"}:
+        raise typer.BadParameter("choose rate or sorry", param_hint="--metric")
     from whisker import term
-    from whisker.results import load_compare
 
     files = [resolve(f) for f in results]
-    rows = load_compare(files)
+    rows = _plot_selection(files, section, match)
     term.heat(rows, only=model, ascii=ascii)
     if save:
         from whisker import figs
 
         models = model or list(dict.fromkeys(r["model"] for r in rows))
-        _figs_out(figs.heat(rows, models, resolve(out), _stem(files), dark=dark, title=title))
+        try:
+            _figs_out(
+                figs.heat(
+                    rows,
+                    models,
+                    resolve(out),
+                    _export_stem(files, section, match, model),
+                    dark=dark,
+                    title=title,
+                    max_rows=max_rows,
+                    split_sections=not bool(match),
+                    metric=metric,
+                )
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+
+
+@plot_app.command("drill")
+def plot_drill(
+    results: ResultsArg,
+    model: ModelsOpt = None,
+    examples: Annotated[
+        bool, Opt("--examples", "-e", help="show refused + answered replies for split prompts")
+    ] = False,
+    sort: Annotated[bool, Opt(help="order prompts by refusal rate within each section")] = False,
+    ascii: AsciiOpt = False,
+    save: SaveOpt = False,
+    dark: DarkOpt = False,
+    out: OutOpt = FIGS,
+    title: TitleOpt = None,
+    section: SectionOpt = None,
+    match: MatchOpt = None,
+    max_rows: RowsOpt = 8,
+    show_base: Annotated[bool, Opt(help="also draw hollow base markers in saved figures")] = False,
+):
+    """Per-prompt refusal rates. Export one small figure per section, not one giant sheet.
+
+    Each saved figure shows k/n and 95% Wilson intervals, without P(Sorry) overlays.
+    --section selects sections; repeated --match combines selected prompts across sections.
+    --sort and --examples retain their terminal behavior. --sort also applies to exports.
+    """
+    from whisker import term
+
+    files = [resolve(f) for f in results]
+    rows = _plot_selection(files, section, match)
+    term.drill(
+        rows,
+        title=" + ".join(f.name for f in files),
+        only=model,
+        examples=examples,
+        sort=sort,
+        ascii=ascii,
+    )
+    if save:
+        from whisker import figs
+
+        models = model or [m for m in dict.fromkeys(r["model"] for r in rows) if m != "base"]
+        try:
+            for m in models or ["base"]:
+                _figs_out(
+                    figs.drill(
+                        rows,
+                        m,
+                        resolve(out),
+                        _export_stem(files, section, match, model),
+                        dark=dark,
+                        title=title,
+                        max_rows=max_rows,
+                        split_sections=not bool(match),
+                        show_base=show_base,
+                        sort=sort,
+                    )
+                )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
 
 
 @plot_app.command("disagree")
